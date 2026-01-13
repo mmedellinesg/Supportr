@@ -8,7 +8,7 @@ from pytorch_transformers import BertForSequenceClassification
 from multiprocessing import Pool, cpu_count
 from .convert_examples_to_features import convert_example_to_feature
 from tqdm import tqdm
-from .regression_processor import RegressionProcessor
+from .regression_processor import InputExample
 from .download_features import fetch_pretrained_model
 import logging
 from os.path import expanduser
@@ -50,19 +50,21 @@ class Supportr:
         self.chunksize = CHUNKSIZE
 
     def predict(self,text):
-        text1 = pd.DataFrame(text, columns=['body'])
-        train_df_bert = pd.DataFrame({
-            'id': range(len(text)),
-            'label': 0,
-            'alpha': ['a'] * text1.shape[0],
-            'text': text1['body'].replace(r'\n', ' ', regex=True)
-        })
-        train_df_bert.to_csv('train_regression.tsv', sep='\t', index=False, header=False)
+        # Normalize inputs
+        if isinstance(text, str):
+            text = [text]
 
-        processor = RegressionProcessor()
-        train_examples = processor.get_train_examples('')
+        # Important: kill tabs/newlines so tokenization/parsing can’t do weird stuff
+        texts = [
+            ("" if t is None else str(t)).replace("\n", " ").replace("\t", " ")
+            for t in text
+        ]
+
+        train_examples = [
+            InputExample(guid=f"pred-{i}", text_a=t, text_b=None, label=0.0)
+            for i, t in enumerate(texts)
+        ]
         train_examples_len = len(train_examples)
-        os.remove('train_regression.tsv')
 
         OUTPUT_MODE = 'regression'
         MAX_SEQ_LENGTH = 128
@@ -90,36 +92,32 @@ class Supportr:
 
         bert_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids)
         bert_dataloader = DataLoader(bert_data, batch_size=self.batch_size)
+
         preds = []
 
-        if self.device.type == 'cpu':
-            for step, batch in enumerate(tqdm(bert_dataloader)):
-                batch = tuple(t.to(self.device) for t in batch)
-                input_ids, input_mask, segment_ids, label_ids = batch
-                with torch.no_grad():
-                    logits = self.model(input_ids, segment_ids, input_mask, labels=None)
-                # logits = logits.detach().cpu()
+        for step, batch in enumerate(tqdm(bert_dataloader)):
+            # Move to device
+            batch = tuple(t.to(self.device) for t in batch)
+            input_ids, input_mask, segment_ids, label_ids = batch
 
-                preds.append(logits)
-            preds = [item for sublist in preds for item in sublist]
-            preds = np.squeeze(np.array(preds[0]))
-        else:
-            for step, batch in enumerate(tqdm(bert_dataloader)):
-                batch = tuple(t.cuda() for t in batch)
-                input_ids, input_mask, segment_ids, label_ids = batch
-                with torch.no_grad():
-                    logits = self.model(input_ids, segment_ids, input_mask, labels=None)
+            with torch.no_grad():
+                logits = self.model(input_ids, segment_ids, input_mask, labels=None)
 
+            # Your model returns a tuple on GPU branch in your code; normalize it:
+            if isinstance(logits, (tuple, list)):
                 logits = logits[0]
-                logits = logits.detach().cpu()
-                if len(preds) == 0:
-                    preds.append(logits)
-                else:
-                    preds[0] = np.append(
-                        preds[0], logits, axis=0)
-            preds = [item for sublist in preds for item in sublist]
-            preds = np.squeeze(np.array(preds))
+
+            # logits shape: (batch_size, 1) for regression
+            preds.append(logits.detach().cpu())
+
+        # Concatenate along batch dimension
+        preds = torch.cat(preds, dim=0).numpy()
+
+        # Flatten to shape (N,)
+        preds = preds.reshape(-1)
+
         return preds
+
 
 
 
